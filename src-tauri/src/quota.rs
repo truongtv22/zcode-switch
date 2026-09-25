@@ -20,7 +20,7 @@ fn no_window(prog: &str) -> std::process::Command {
 pub const QUOTA_LIMIT_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
 pub const SUBSCRIPTION_URL: &str = "https://open.bigmodel.cn/api/biz/subscription/list";
 pub const BILLING_BALANCE_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
-pub const CLIENT_APP_VERSION: &str = "3.11.2";
+pub const CLIENT_APP_VERSION: &str = "3.14.3";
 
 pub(crate) fn client_platform() -> String {
     let os = crate::zcrypto::node_platform_for(std::env::consts::OS);
@@ -133,41 +133,83 @@ pub(crate) fn zcode_app_version() -> String {
     static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            for hive in [
-                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-                r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-                r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-            ] {
-                let Ok(out) = no_window("reg").args(["query", hive, "/s"]).output() else {
-                    continue;
-                };
-                let txt = String::from_utf8_lossy(&out.stdout);
-                let (mut name, mut ver) = (String::new(), String::new());
-                for line in txt.lines() {
-                    let l = line.trim();
-                    if l.starts_with("HKEY_") {
-                        if is_zcode_display_name(&name) && !ver.is_empty() {
-                            return normalize_version(&ver);
-                        }
-                        name.clear();
-                        ver.clear();
-                        continue;
-                    }
-                    if let Some(rest) = l.strip_prefix("DisplayName") {
-                        name = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
-                    } else if let Some(rest) = l.strip_prefix("DisplayVersion") {
-                        ver = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
-                    }
-                }
-                if is_zcode_display_name(&name) && !ver.is_empty() {
-                    return normalize_version(&ver);
-                }
-            }
-            CLIENT_APP_VERSION.to_string()
+            registry_app_version()
+                .or_else(macos_app_version)
+                .map(|v| normalize_version(&v))
+                .unwrap_or_else(|| CLIENT_APP_VERSION.to_string())
         })
         .clone()
 }
 
+#[cfg(windows)]
+fn registry_app_version() -> Option<String> {
+    for hive in [
+        r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+    ] {
+        let Ok(out) = no_window("reg").args(["query", hive, "/s"]).output() else {
+            continue;
+        };
+        let txt = String::from_utf8_lossy(&out.stdout);
+        let (mut name, mut ver) = (String::new(), String::new());
+        for line in txt.lines() {
+            let l = line.trim();
+            if l.starts_with("HKEY_") {
+                if is_zcode_display_name(&name) && !ver.is_empty() {
+                    return Some(ver);
+                }
+                name.clear();
+                ver.clear();
+                continue;
+            }
+            if let Some(rest) = l.strip_prefix("DisplayName") {
+                name = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
+            } else if let Some(rest) = l.strip_prefix("DisplayVersion") {
+                ver = rest.trim_start().trim_start_matches("REG_SZ").trim().to_string();
+            }
+        }
+        if is_zcode_display_name(&name) && !ver.is_empty() {
+            return Some(ver);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn registry_app_version() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_version() -> Option<String> {
+    for plist in [
+        "/Applications/ZCode.app/Contents/Info.plist".to_string(),
+        format!(
+            "{}/Applications/ZCode.app/Contents/Info.plist",
+            std::env::var("HOME").unwrap_or_default()
+        ),
+    ] {
+        let Ok(out) = no_window("defaults")
+            .args(["read", &plist, "CFBundleShortVersionString"])
+            .output()
+        else {
+            continue;
+        };
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_app_version() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
 fn is_zcode_display_name(name: &str) -> bool {
     let l = name.to_lowercase();
     l.contains("zcode") && !l.contains("switch")
