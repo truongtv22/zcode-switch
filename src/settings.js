@@ -58,6 +58,7 @@ const actions = {
         launchAfterSwitch: key === "launch" ? !state.launch_after_switch : null,
         closeToTray: key === "tray" ? !state.close_to_tray : null,
         hotSwitch: key === "hot" ? !state.hot_switch : null,
+        plainExport: key === "plain" ? !state.plain_export : null,
       });
       await refresh(); render();
       toast(t("s.savedToast"));
@@ -68,7 +69,13 @@ const actions = {
     await guard(async () => {
       const p = await invoke("export_all_pick_path");
       if (!p.picked) { toast(t("m.exportCanceled")); return; }
-      openPwModal({ mode: "exportAll", path: p.path, count: p.count, onDone: () => actions.refresh() });
+      if (p.plain) {
+        const r = await invoke("export_all_finalize", { path: p.path });
+        toast(t("pw.exportedAllToast", { count: r.count }), "ok", r.path);
+        actions.refresh();
+      } else {
+        openPwModal({ mode: "exportAll", path: p.path, count: p.count, onDone: () => actions.refresh() });
+      }
     });
   },
 
@@ -77,9 +84,17 @@ const actions = {
       const p = await invoke("import_pick_files");
       if (!p.picked) return;
       const sealed = p.sealed || [];
+      const plain = p.plain || [];
       const preErrors = p.errors || [];
       if (sealed.length) {
-        openPwModal({ mode: "import", files: sealed, preErrors, onDone: (rep) => actions.finishImport(rep) });
+        // Có file mã hóa (.zsb) → cần mật khẩu; file plain được import_sealed xử lý luôn
+        openPwModal({ mode: "import", files: [...sealed, ...plain], preErrors, onDone: (rep) => actions.finishImport(rep) });
+        return;
+      }
+      if (plain.length) {
+        const rep = await invoke("import_sealed", { files: plain, password: "" });
+        rep.errors = [...preErrors, ...(rep.errors || [])];
+        actions.finishImport(rep);
         return;
       }
       actions.finishImport({ added: [], skipped: [], errors: preErrors });
@@ -178,6 +193,7 @@ function render() {
       ${toggle(s.launch_after_switch, "actions.toggleBehavior('launch')", t("s.launchAfter"), t("s.launchAfterDesc"))}
       ${toggle(s.close_to_tray, "actions.toggleBehavior('tray')", t("s.closeTray"), t("s.closeTrayDesc"))}
       ${toggle(s.hot_switch, "actions.toggleBehavior('hot')", t("s.hotSwitch"), t("s.hotSwitchDesc"))}
+      ${toggle(s.plain_export, "actions.toggleBehavior('plain')", t("s.plainExport"), t("s.plainExportDesc"))}
       <label style="margin-top:14px">${t("s.authLabel")}</label>
       ${toggle(s.auth_proxy_on, "actions.toggleAuthProxy()", t("s.proxyToggle"), t("s.proxyToggleDesc"))}
       <div class="path-line" style="margin-top:6px">

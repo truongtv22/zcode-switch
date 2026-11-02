@@ -142,6 +142,8 @@ pub struct Settings {
     pub language: Option<String>,
     #[serde(default)]
     pub auto_claim: Option<bool>,
+    #[serde(default)]
+    pub plain_export: Option<bool>,
 }
 
 impl Settings {
@@ -149,6 +151,8 @@ impl Settings {
     pub fn close_to_tray(&self) -> bool { self.close_to_tray.unwrap_or(true) }
     pub fn hot_switch(&self) -> bool { self.hot_switch.unwrap_or(false) }
     pub fn auto_claim(&self) -> bool { self.auto_claim.unwrap_or(false) }
+    /// Export mặc định không mã hóa (plaintext .json)
+    pub fn plain_export(&self) -> bool { self.plain_export.unwrap_or(true) }
     pub fn auth_proxy(&self) -> Option<&str> {
         if self.auth_proxy_on.unwrap_or(false) {
             self.auth_proxy_url.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -187,6 +191,7 @@ pub struct AppState {
     pub close_to_tray: bool,
     pub hot_switch: bool,
     pub auto_claim: bool,
+    pub plain_export: bool,
     pub auth_proxy_on: bool,
     pub auth_proxy_url: Option<String>,
     pub language: String,
@@ -948,6 +953,55 @@ pub fn switch_to(paths: &Paths, id: &str, force: bool, restart: bool, hot: bool)
     })
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogoutResult {
+    pub preserved_as: Option<String>,
+    pub killed: bool,
+    pub launched: bool,
+}
+
+/// Đăng xuất: bảo toàn login hiện tại vào thư viện rồi xóa credentials.json.
+/// Chưa đăng nhập thì không làm gì (idempotent).
+pub fn logout_live(paths: &Paths, restart: bool) -> Result<LogoutResult, String> {
+    let live = read_live(paths)?;
+    if !live.as_ref().is_some_and(|v| is_logged_in(v)) {
+        return Ok(LogoutResult { preserved_as: None, killed: false, launched: false });
+    }
+
+    let mut killed = false;
+    if zcode_running() {
+        if !kill_zcode()? {
+            return Err(tr("err.switch.kill_timeout"));
+        }
+        killed = true;
+    }
+
+    // Bảo toàn trước khi xóa: cập nhật slot khớp trong thư viện,
+    // login chưa có slot thì auto_preserve lưu slot mới (không bao giờ丢号)
+    let accounts = list_accounts(paths)?;
+    sync_live_back_to_source(paths, &accounts)?;
+    let accounts = list_accounts(paths)?;
+    let preserved_as = auto_preserve(paths, &accounts, "")?;
+
+    // credentials.json biến mất = trạng thái chưa đăng nhập (như cài mới)
+    match std::fs::remove_file(paths.live_file()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(trf("err.file.remove", &[("e", &e.to_string())])),
+    }
+    reset_live_plan_cache(paths);
+
+    let mut launched = false;
+    if restart {
+        let (p, ok) = effective_zcode_path(paths);
+        if ok && launch_zcode(&p).is_ok() {
+            launched = true;
+        }
+    }
+    Ok(LogoutResult { preserved_as, killed, launched })
+}
+
 const RELAY_PASS_KEY: &str = "web-remote-control:external-relay:pass_hash";
 
 fn inject_relay_pass_hash(creds: &Value, relay: Option<&Value>) -> Value {
@@ -1387,9 +1441,12 @@ fn adopt_virtual_arms_uid(paths: &Paths, acc: &mut Account) -> Result<(), String
     save_account(paths, acc)
 }
 
+/// Định dạng payload bundle (bên trong sealed envelope hoặc file .json plaintext)
+pub const BUNDLE_FORMAT: &str = "zcode-accounts-bundle";
+
 pub fn export_bundle_value(accounts: &[Account]) -> Value {
     json!({
-        "format": "zcode-accounts-bundle",
+        "format": BUNDLE_FORMAT,
         "version": 2,
         "exportedAt": now_ts(),
         "accounts": accounts.iter().map(|a| json!({
@@ -1404,7 +1461,7 @@ pub fn export_bundle_value(accounts: &[Account]) -> Value {
 type ImportCandidate = (Option<String>, Value, Option<Value>);
 
 fn import_candidates(v: &Value) -> Result<Vec<ImportCandidate>, String> {
-    if v.get("format").and_then(|f| f.as_str()) == Some("zcode-accounts-bundle") {
+    if v.get("format").and_then(|f| f.as_str()) == Some(BUNDLE_FORMAT) {
         let arr = v
             .get("accounts")
             .and_then(|a| a.as_array())
@@ -1518,6 +1575,7 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         close_to_tray: settings.close_to_tray(),
         hot_switch: settings.hot_switch(),
         auto_claim: settings.auto_claim(),
+        plain_export: settings.plain_export(),
         auth_proxy_on: settings.auth_proxy_on.unwrap_or(false),
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),

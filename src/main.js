@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { esc, toast, openPwModal, openConfirmModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
+import { esc, toast, openConfirmModal, openPwModal, openProviderModal, installDelegation, dismissSplash } from "./ui.js";
 import { ic } from "./icons.js";
 import { init, t, has, lang, localeTag, stripErr } from "./i18n.js";
 
@@ -252,7 +252,12 @@ const actions = {
     await guard(async () => {
       const p = await invoke("export_pick_path", { id });
       if (!p.picked) { toast(t("m.exportCanceled")); return; }
-      openPwModal({ mode: "export", id, path: p.path, name: p.name });
+      if (p.plain) {
+        const r = await invoke("export_finalize", { path: p.path, id });
+        toast(t("pw.exportedToast", { path: r.path }), "ok", t("pw.exportedToastDetail"));
+      } else {
+        openPwModal({ mode: "export", id, path: p.path, name: p.name });
+      }
     });
   },
 
@@ -278,6 +283,29 @@ const actions = {
     await guard(async () => {
       await invoke("kill_zcode");
       toast(t("m.toastKilled"));
+      await refresh(); render();
+    });
+  },
+
+  askLogout() {
+    openConfirmModal({
+      kind: "danger",
+      icon: "logOut",
+      title: t("m.logoutTitle"),
+      desc: esc(t("m.logoutSub")),
+      yesLabel: t("m.logoutYes"),
+      onYes: () => actions.doLogout(),
+    });
+  },
+
+  async doLogout() {
+    await guard(async () => {
+      const r = await invoke("logout");
+      if (!r.killed && !r.preservedAs && !r.launched) {
+        toast(t("m.toastLoggedOutClean"));
+      } else {
+        toast(t("m.toastLoggedOut"), "ok", r.preservedAs ? t("m.toastLoggedOutSaved", { name: r.preservedAs }) : undefined);
+      }
       await refresh(); render();
     });
   },
@@ -851,6 +879,9 @@ function render() {
       ${s.zcode_running
         ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
         : `<button class="btn-ghost has-ic" click="actions.launch()" ${s.zcode_path_ok ? "" : "disabled"}>${ic("play", 14)} ${t("btn.launchZcode")}</button>`}
+      ${s.live_logged_in
+        ? `<button class="btn-ghost has-ic" click="actions.askLogout()" title="${t("btn.logoutTitle")}">${ic("logOut", 16)} ${t("btn.logout")}</button>`
+        : ""}
       <span class="tb-spacer"></span>
       <button class="btn-ghost tb-gear has-ic" click="actions.openSettings()" aria-label="${t("common.settings")}" title="${t("common.settings")}">${ic("sliders", 16)}</button>
     </section>

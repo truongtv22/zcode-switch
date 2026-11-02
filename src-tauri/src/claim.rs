@@ -9,6 +9,7 @@ use std::time::Duration;
 pub const BILLING_PREVIEW_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
 pub const BILLING_CLAIM_URL: &str = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
 pub const CLIENT_CONFIGS_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
+pub const MARKETING_TOUCH_URL: &str = "https://zcode.z.ai/api/v1/marketing/touch";
 
 const CLAIM_TIMEOUT_SECS: u64 = 25;
 
@@ -227,7 +228,79 @@ pub fn preview_plans(
         quota::zcode_app_version(),
         quota::client_platform()
     );
-    preview_once(&url, &token, device_mid)
+    let mut out = preview_once(&url, &token, device_mid.clone())?;
+    // Banner campaign (ví dụ zcode-v3-start-plan-1102) server chỉ phân phối qua
+    // marketing/touch, không đưa vào billing/preview — bù nguồn detect từ đây.
+    // Lỗi touch bỏ qua (best-effort); billing/preview lỗi thì vẫn báo lỗi như cũ.
+    for p in touch_plans(&token, device_mid) {
+        if !out.iter().any(|x| x.plan_id == p.plan_id) {
+            out.push(p);
+        }
+    }
+    out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    Ok(out)
+}
+
+fn touch_plans(token: &str, mid: Option<String>) -> Vec<ClaimPlan> {
+    let mut req = agent().get(&format!("{MARKETING_TOUCH_URL}?seq=0"));
+    for (k, v) in quota::zai_billing_headers_with_mid(token, mid) {
+        req = req.set(&k, &v);
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let body = match resp.into_string() {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&body) else {
+        return Vec::new();
+    };
+    if v.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) != 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(deliveries) = v.pointer("/data/deliveries").and_then(|d| d.as_array()) {
+        for d in deliveries {
+            // Chỉ lấy delivery có nút claim — banner chỉ hiển thị thì bỏ qua
+            if has_claim_action(d) {
+                collect_zcode_plans(d, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn has_claim_action(v: &Value) -> bool {
+    if v.get("type").and_then(|t| t.as_str()) == Some("claim_zcode_plan") {
+        return true;
+    }
+    match v {
+        Value::Array(a) => a.iter().any(has_claim_action),
+        Value::Object(o) => o.values().any(has_claim_action),
+        _ => false,
+    }
+}
+
+fn collect_zcode_plans(v: &Value, out: &mut Vec<ClaimPlan>) {
+    let is_plan = v
+        .get("plan_id")
+        .and_then(|x| x.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+        && v.get("entitlements").is_some();
+    if is_plan {
+        if let Some(p) = parse_plan(v) {
+            if !out.iter().any(|x| x.plan_id == p.plan_id) {
+                out.push(p);
+            }
+        }
+    }
+    match v {
+        Value::Array(a) => a.iter().for_each(|c| collect_zcode_plans(c, out)),
+        Value::Object(o) => o.values().for_each(|c| collect_zcode_plans(c, out)),
+        _ => {}
+    }
 }
 
 fn http_err(prefix: &str, e: ureq::Error) -> String {
@@ -264,8 +337,7 @@ fn preview_once(url: &str, token: &str, mid: Option<String>) -> Result<Vec<Claim
         .and_then(|p| p.as_array())
         .cloned()
         .unwrap_or_default();
-    let mut out: Vec<ClaimPlan> = plans.iter().filter_map(parse_plan).collect();
-    out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.plan_id.cmp(&b.plan_id)));
+    let out: Vec<ClaimPlan> = plans.iter().filter_map(parse_plan).collect();
     Ok(out)
 }
 
@@ -438,5 +510,85 @@ pub fn failure_message(code: i64, body: &Value) -> String {
         base
     } else {
         crate::i18n::trf("claim.fail.with_server", &[("base", &base), ("server_msg", &server_msg)])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fixture rút gọn từ capture thật 2026-11-02: campaign 2101141259813175296,
+    // banner + success_popup cùng trỏ một zcode_plan → phải dedupe còn 1.
+    const TOUCH_DELIVERY: &str = r#"{
+        "campaign_id": "2101141259813175296",
+        "resource_position": "banner",
+        "priority": 50,
+        "banner": {
+            "buttons": [
+                {"action": {"type": "close", "args": null}},
+                {"action": {"type": "claim_zcode_plan", "args": {"plan_id": "zcode-v3-start-plan-1102"}}}
+            ],
+            "background": {"args": {"zcode_plan": {
+                "plan_id": "zcode-v3-start-plan-1102",
+                "name": "ZCODE GLOBAL BUILD",
+                "priority": 111,
+                "entitlements": [{
+                    "entitlement_id": "ent-zcode-v3-start-plan-1102-1",
+                    "show_name": "GLM-5.3-Flash",
+                    "meter": "model_usage",
+                    "unit_type": "token",
+                    "capabilities": ["model:glm-5.3-flash"],
+                    "grant_units": 300000000,
+                    "period": "one_time"
+                }]
+            }}}
+        },
+        "success_popup": {
+            "hero": {"args": {"zcode_plan": {
+                "plan_id": "zcode-v3-start-plan-1102",
+                "name": "ZCODE GLOBAL BUILD",
+                "priority": 111,
+                "entitlements": [{
+                    "show_name": "GLM-5.3-Flash",
+                    "meter": "model_usage",
+                    "unit_type": "token",
+                    "grant_units": 300000000,
+                    "period": "one_time"
+                }]
+            }}}
+        }
+    }"#;
+
+    fn delivery() -> Value {
+        serde_json::from_str(TOUCH_DELIVERY).unwrap()
+    }
+
+    #[test]
+    fn touch_delivery_maps_to_one_claim_plan() {
+        let d = delivery();
+        assert!(has_claim_action(&d));
+        let mut out = Vec::new();
+        collect_zcode_plans(&d, &mut out);
+        assert_eq!(out.len(), 1);
+        let p = &out[0];
+        assert_eq!(p.plan_id, "zcode-v3-start-plan-1102");
+        assert_eq!(p.name, "ZCODE GLOBAL BUILD");
+        assert_eq!(p.priority, 111);
+        assert_eq!(p.grant_items.len(), 1);
+        assert_eq!(p.grant_items[0].name, "GLM-5.3-Flash");
+        assert_eq!(p.grant_items[0].units, 3.0e8);
+        assert_eq!(p.grant_items[0].period, "one_time");
+    }
+
+    #[test]
+    fn delivery_without_claim_button_is_skipped() {
+        let d: Value = serde_json::from_str(
+            r#"{"banner":{"buttons":[{"action":{"type":"close","args":null}}]}}"#,
+        )
+        .unwrap();
+        assert!(!has_claim_action(&d));
+        let mut out = Vec::new();
+        collect_zcode_plans(&d, &mut out);
+        assert!(out.is_empty());
     }
 }

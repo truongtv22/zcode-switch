@@ -122,8 +122,8 @@ export function openConfirmModal(m) {
 export function openPwModal(m) {
   document.querySelector(".pw-mask")?.remove();
   const isExport = m.mode === "export" || m.mode === "exportAll";
-  const title = m.mode === "export" ? t("pw.exportTitle", { name: esc(m.name) })
-    : m.mode === "exportAll" ? t("pw.exportAllTitle", { count: m.count })
+  const title = isExport
+    ? (m.mode === "export" ? t("pw.exportTitle", { name: esc(m.name) }) : t("pw.exportAllTitle", { count: m.count }))
     : t("pw.importTitle", { count: m.files.length });
   const sub = isExport
     ? t("pw.exportSub", { path: esc(m.path) })
@@ -164,25 +164,25 @@ export function openPwModal(m) {
     const pw1 = input1?.value || "";
     const pw2 = input2?.value;
     if (pw1.length < 6) return (errEl.textContent = t("pw.errMinLen"));
-    if (pw2 !== undefined && pw2 !== null && pw1 !== pw2) return (errEl.textContent = t("pw.errMismatch"));
+    if (isExport && pw2 !== undefined && pw1 !== pw2) return (errEl.textContent = t("pw.errMismatch"));
     go.disabled = true;
     try {
       if (m.mode === "export") {
         const r = await invoke("export_finalize", { path: m.path, id: m.id, password: pw1 });
-        toast(t("pw.exportedToast", { path: r.path }), "ok", t("pw.exportedToastDetail"));
+        toast(t("pw.exportedToast", { path: r.path }), "ok");
         m.onDone?.(r);
       } else if (m.mode === "exportAll") {
         const r = await invoke("export_all_finalize", { path: m.path, password: pw1 });
         toast(t("pw.exportedAllToast", { count: r.count }), "ok", r.path);
         m.onDone?.(r);
       } else {
-        let report = await invoke("import_sealed", { files: m.files, password: pw1 });
-        if (m.preErrors?.length) {
-          report.errors = [...m.preErrors, ...(report.errors || [])];
-        }
-        const wrongPw = (report.errors || []).some((e) => errCode(e) === "wrong_password" || String(e).includes("密码错误"));
-        if (wrongPw) { errEl.textContent = t("pw.errWrong"); go.disabled = false; return; }
-        m.onDone?.(report);
+      let report = await invoke("import_sealed", { files: m.files, password: pw1 });
+      if (m.preErrors?.length) {
+        report.errors = [...m.preErrors, ...(report.errors || [])];
+      }
+      const wrongPw = (report.errors || []).some((e) => errCode(e) === "wrong_password" || String(e).includes("密码错误"));
+      if (wrongPw) { errEl.textContent = t("pw.errWrong"); go.disabled = false; return; }
+      m.onDone?.(report);
       }
       mask.remove();
     } catch (e) {

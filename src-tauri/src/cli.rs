@@ -28,6 +28,22 @@ fn resolve_password(rest: &[String]) -> Option<String> {
     std::env::var("ZSW_PASSWORD").ok().filter(|p| !p.is_empty())
 }
 
+fn write_bundle_payload(out_path: &str, payload: &Value, password: Option<String>) -> Result<bool, String> {
+    let ser = |v: &Value| {
+        serde_json::to_string_pretty(v)
+            .map_err(|e| crate::i18n::trf("err.serialize", &[("e", &e.to_string())]))
+    };
+    let (body, encrypted) = match password.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(pw) => {
+            let sealed = crate::cipher::seal(payload, pw, crate::cipher::FORMAT_BUNDLE)?;
+            (ser(&sealed)?, true)
+        }
+        None => (ser(payload)?, false),
+    };
+    atomic_write(std::path::Path::new(out_path), &(body + "\n"))?;
+    Ok(encrypted)
+}
+
 fn ok(v: Value) -> String {
     let mut m = v.as_object().cloned().unwrap_or_default();
     m.insert("ok".into(), Value::Bool(true));
@@ -201,6 +217,7 @@ pub fn run(args: &[String]) -> (String, i32) {
         "behavior" => {
             let las = flag(rest, "--launch-after-switch");
             let ctt = flag(rest, "--close-to-tray");
+            let pex = flag(rest, "--plain-export");
             let mut s = load_settings(&paths);
             if let Some(v) = las {
                 s.launch_after_switch = Some(parse_bool(&v));
@@ -208,11 +225,28 @@ pub fn run(args: &[String]) -> (String, i32) {
             if let Some(v) = ctt {
                 s.close_to_tray = Some(parse_bool(&v));
             }
+            if let Some(v) = pex {
+                s.plain_export = Some(parse_bool(&v));
+            }
             match save_settings(&paths, &s) {
                 Ok(()) => ok(json!({
                     "launch_after_switch": s.launch_after_switch(),
                     "close_to_tray": s.close_to_tray(),
+                    "plain_export": s.plain_export(),
                 })),
+                Err(e) => return (err(&e), 1),
+            }
+        }
+        "logout" => {
+            let restart = if has_flag(rest, "--restart") {
+                true
+            } else if has_flag(rest, "--no-restart") {
+                false
+            } else {
+                load_settings(&paths).launch_after_switch()
+            };
+            match logout_live(&paths, restart) {
+                Ok(r) => ok(serde_json::to_value(&r).unwrap_or(Value::Null)),
                 Err(e) => return (err(&e), 1),
             }
         }
@@ -220,22 +254,25 @@ pub fn run(args: &[String]) -> (String, i32) {
             let (Some(id), Some(out_path)) = (flag(rest, "--id"), flag(rest, "--out")) else {
                 return (err(&crate::i18n::tr("cli.usage.export")), 2);
             };
-            let Some(password) = resolve_password(rest) else {
-                return (err(&crate::i18n::tr("cli.pw_hint")), 2);
+            let encrypt = if has_flag(rest, "--plain") {
+                false
+            } else {
+                has_flag(rest, "--encrypt") || !load_settings(&paths).plain_export()
+            };
+            let password = if encrypt {
+                let Some(p) = resolve_password(rest) else {
+                    return (err(&crate::i18n::tr("cli.pw_hint")), 2);
+                };
+                Some(p)
+            } else {
+                None
             };
             match load_account(&paths, &id) {
                 Ok(a) => {
                     let payload = export_bundle_value(std::slice::from_ref(&a));
-                    match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
-                        Ok(sealed) => match serde_json::to_string_pretty(&sealed) {
-                            Ok(body) => match atomic_write(std::path::Path::new(&out_path), &(body + "\n")) {
-                                Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
-                                Err(e) => return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1),
-                            },
-                            Err(e) => return (err(&crate::i18n::trf("err.serialize", &[("e", &e.to_string())])), 1),
-                        },
-                        Err(e) => return (err(&e), 1),
-                    }
+                    write_bundle_payload(&out_path, &payload, password)
+                        .map(|enc| ok(json!({ "out": out_path, "encrypted": enc })))
+                        .unwrap_or_else(|e| (err(&e), 1))
                 }
                 Err(e) => return (err(&e), 1),
             }
@@ -244,17 +281,23 @@ pub fn run(args: &[String]) -> (String, i32) {
             let Some(out_path) = flag(rest, "--out") else {
                 return (err(&crate::i18n::tr("cli.usage.export_all")), 2);
             };
-            let Some(password) = resolve_password(rest) else {
-                return (err(&crate::i18n::tr("cli.pw_hint")), 2);
+            let encrypt = if has_flag(rest, "--plain") {
+                false
+            } else {
+                has_flag(rest, "--encrypt") || !load_settings(&paths).plain_export()
+            };
+            let password = if encrypt {
+                let Some(p) = resolve_password(rest) else {
+                    return (err(&crate::i18n::tr("cli.pw_hint")), 2);
+                };
+                Some(p)
+            } else {
+                None
             };
             match list_accounts(&paths).map(|a| export_bundle_value(&a)) {
-                Ok(payload) => match crate::cipher::seal(&payload, &password, crate::cipher::FORMAT_BUNDLE) {
-                    Ok(sealed) => match atomic_write(std::path::Path::new(&out_path), &(serde_json::to_string_pretty(&sealed).unwrap() + "\n")) {
-                        Ok(()) => ok(json!({ "out": out_path, "encrypted": true })),
-                        Err(e) => return (err(&crate::i18n::trf("err.write", &[("e", &e)])), 1),
-                    },
-                    Err(e) => return (err(&e), 1),
-                },
+                Ok(payload) => write_bundle_payload(&out_path, &payload, password)
+                    .map(|enc| ok(json!({ "out": out_path, "encrypted": enc })))
+                    .unwrap_or_else(|e| (err(&e), 1)),
                 Err(e) => return (err(&e), 1),
             }
         }
@@ -270,18 +313,20 @@ pub fn run(args: &[String]) -> (String, i32) {
                 Ok(v) => v,
                 Err(e) => return (err(&crate::i18n::trf("cli.json_fail", &[("e", &e.to_string())])), 1),
             };
-            if !crate::cipher::is_sealed(&v) {
-                return (err(&crate::i18n::tr("err.import.not_sealed_plain")), 2);
-            }
-            if v.get("format").and_then(|f| f.as_str()) != Some(crate::cipher::FORMAT_BUNDLE) {
-                return (err(&crate::i18n::tr("err.import.not_bundle_plain")), 2);
-            }
-            let Some(password) = resolve_password(rest) else {
-                return (err(&crate::i18n::tr("cli.pw_hint")), 2);
-            };
-            let entries = match crate::cipher::open(&v, &password) {
-                Ok(payload) => vec![(file, payload)],
-                Err(e) => return (err(&e), 1),
+            // .zsb mã hóa (cũ) cần password; .json plaintext thì dùng payload trực tiếp
+            let entries = if crate::cipher::is_sealed(&v) {
+                if v.get("format").and_then(|f| f.as_str()) != Some(crate::cipher::FORMAT_BUNDLE) {
+                    return (err(&crate::i18n::tr("err.import.not_bundle_plain")), 2);
+                }
+                let Some(password) = resolve_password(rest) else {
+                    return (err(&crate::i18n::tr("cli.pw_hint")), 2);
+                };
+                match crate::cipher::open(&v, &password) {
+                    Ok(payload) => vec![(file, payload)],
+                    Err(e) => return (err(&e), 1),
+                }
+            } else {
+                vec![(file, v)]
             };
             match import_values(&paths, &entries) {
                 Ok(rep) => ok(serde_json::to_value(&rep).unwrap_or(Value::Null)),

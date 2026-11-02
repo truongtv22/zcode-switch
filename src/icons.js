@@ -28,6 +28,8 @@ const ICONS = {
 
   power: P("M8 2v5.5") + P("M4.6 4.3a5 5 0 1 0 6.8 0"),
 
+  logOut: P("M9.5 13.5H3.5v-11h6") + P("M6.5 8h7") + P("M11 5.5 13.5 8 11 10.5"),
+
   sliders: P("M2 4.5h12") + P("M2 11.5h12") + `<rect x="8.5" y="2.5" width="4" height="4"/>` + `<rect x="3.5" y="9.5" width="4" height="4"/>`,
 
   lock: `<rect x="3.5" y="7.2" width="9" height="6.3"/>` + P("M5.5 7.2V5a2.5 2.5 0 0 1 5 0v2.2") + P("M8 9.7v1.8"),

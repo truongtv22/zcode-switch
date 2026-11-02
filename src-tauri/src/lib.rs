@@ -204,6 +204,16 @@ async fn switch_to(app: AppHandle, id: String, force: bool, restart: bool) -> Re
 }
 
 #[tauri::command]
+async fn logout(app: AppHandle, restart: Option<bool>) -> Result<store::LogoutResult, String> {
+    let _guard = store_guard();
+    let paths = Paths::detect();
+    let restart = restart.unwrap_or_else(|| load_settings(&paths).launch_after_switch());
+    let r = store::logout_live(&paths, restart);
+    rebuild_tray(&app);
+    r
+}
+
+#[tauri::command]
 async fn get_live_quota() -> Result<quota::QuotaOverview, String> {
     store::live_quota(&Paths::detect())
 }
@@ -845,6 +855,7 @@ async fn set_behavior(
     close_to_tray: Option<bool>,
     hot_switch: Option<bool>,
     auto_claim: Option<bool>,
+    plain_export: Option<bool>,
 ) -> Result<(), String> {
     let _guard = store_guard();
     let paths = Paths::detect();
@@ -860,6 +871,9 @@ async fn set_behavior(
     }
     if let Some(v) = auto_claim {
         s.auto_claim = Some(v);
+    }
+    if let Some(v) = plain_export {
+        s.plain_export = Some(v);
     }
     let r = save_settings(&paths, &s);
     rebuild_tray(&app);
@@ -958,28 +972,47 @@ async fn autostart_set(app: AppHandle, enable: bool) -> Result<bool, String> {
 #[tauri::command]
 async fn export_pick_path(app: AppHandle, id: String) -> Result<serde_json::Value, String> {
     let acc = load_account(&Paths::detect(), &id)?;
-    let default_name = format!("{}.zsb", sanitize_filename(&acc.name));
+    let plain = load_settings(&Paths::detect()).plain_export();
+    let ext = if plain { "json" } else { "zsb" };
+    let dialog_key = if plain { "dialog.json" } else { "dialog.zsb" };
+    let default_name = format!("{}.{}", sanitize_filename(&acc.name), ext);
     let picked = app
         .dialog()
         .file()
-        .add_filter(&i18n::tr("dialog.zsb"), &["zsb"])
+        .add_filter(&i18n::tr(dialog_key), &[ext])
         .set_file_name(&default_name)
         .blocking_save_file();
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };
     let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
-    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "name": acc.name }))
+    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "name": acc.name, "plain": plain }))
+}
+
+fn write_bundle(path: &str, payload: &serde_json::Value, password: Option<String>) -> Result<bool, String> {
+    let (body, encrypted) = match password.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(pw) => {
+            let sealed = cipher::seal(payload, pw, cipher::FORMAT_BUNDLE)?;
+            (serde_json::to_string_pretty(&sealed)
+                .map_err(|e| i18n::trf("err.serialize", &[("e", &e.to_string())]))?, true)
+        }
+        None => (
+            serde_json::to_string_pretty(payload)
+                .map_err(|e| i18n::trf("err.serialize", &[("e", &e.to_string())]))?,
+            false,
+        ),
+    };
+    store::atomic_write(std::path::Path::new(path), &(body + "\n"))
+        .map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
+    Ok(encrypted)
 }
 
 #[tauri::command]
-async fn export_finalize(path: String, id: String, password: String) -> Result<serde_json::Value, String> {
+async fn export_finalize(path: String, id: String, password: Option<String>) -> Result<serde_json::Value, String> {
     let acc = load_account(&Paths::detect(), &id)?;
     let payload = store::export_bundle_value(std::slice::from_ref(&acc));
-    let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
-    let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
-    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
-    Ok(json!({ "saved": true, "path": path }))
+    let encrypted = write_bundle(&path, &payload, password)?;
+    Ok(json!({ "saved": true, "path": path, "encrypted": encrypted }))
 }
 
 #[tauri::command]
@@ -988,30 +1021,29 @@ async fn export_all_pick_path(app: AppHandle) -> Result<serde_json::Value, Strin
     if accounts.is_empty() {
         return Err(i18n::tr("err.export.empty"));
     }
+    let plain = load_settings(&Paths::detect()).plain_export();
     let picked = app
         .dialog()
         .file()
-        .add_filter(&i18n::tr("dialog.zsb"), &["zsb"])
-        .set_file_name("zcode-accounts.zsb")
+        .add_filter(&i18n::tr(if plain { "dialog.json" } else { "dialog.zsb" }), &[if plain { "json" } else { "zsb" }])
+        .set_file_name(if plain { "zcode-accounts.json" } else { "zcode-accounts.zsb" })
         .blocking_save_file();
     let Some(fp) = picked else {
         return Ok(json!({ "picked": false }));
     };
     let path = fp.into_path().map_err(|e| i18n::trf("err.path.invalid", &[("e", &e.to_string())]))?;
-    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "count": accounts.len() }))
+    Ok(json!({ "picked": true, "path": path.to_string_lossy(), "count": accounts.len(), "plain": plain }))
 }
 
 #[tauri::command]
-async fn export_all_finalize(path: String, password: String) -> Result<serde_json::Value, String> {
+async fn export_all_finalize(path: String, password: Option<String>) -> Result<serde_json::Value, String> {
     let accounts = list_accounts(&Paths::detect())?;
     if accounts.is_empty() {
         return Err(i18n::tr("err.export.empty_short"));
     }
     let payload = store::export_bundle_value(&accounts);
-    let sealed = cipher::seal(&payload, &password, cipher::FORMAT_BUNDLE)?;
-    let body = serde_json::to_string_pretty(&sealed).unwrap() + "\n";
-    store::atomic_write(std::path::Path::new(&path), &body).map_err(|e| i18n::trf("err.write", &[("e", &e.to_string())]))?;
-    Ok(json!({ "saved": true, "path": path, "count": accounts.len() }))
+    let encrypted = write_bundle(&path, &payload, password)?;
+    Ok(json!({ "saved": true, "path": path, "count": accounts.len(), "encrypted": encrypted }))
 }
 
 #[tauri::command]
@@ -1019,12 +1051,13 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
     let picked = app
         .dialog()
         .file()
-        .add_filter(&i18n::tr("dialog.zsb"), &["zsb"])
+        .add_filter(&i18n::tr("dialog.zsb"), &["json", "zsb"])
         .blocking_pick_files();
     let Some(files) = picked else {
         return Ok(json!({ "picked": false }));
     };
     let mut sealed = vec![];
+    let mut plain = vec![];
     let mut errors = vec![];
     for fp in files {
         let path = match fp.into_path() {
@@ -1044,18 +1077,22 @@ async fn import_pick_files(app: AppHandle) -> Result<serde_json::Value, String> 
         };
         match serde_json::from_str::<Value>(&raw) {
             Ok(v) => {
-                if !cipher::is_sealed(&v) {
-                    errors.push(i18n::trf("err.import.not_sealed", &[("fname", fname.as_str())]));
-                } else if v.get("format").and_then(|f| f.as_str()) != Some(cipher::FORMAT_BUNDLE) {
-                    errors.push(i18n::trf("err.import.not_bundle", &[("fname", fname.as_str())]));
+                if cipher::is_sealed(&v) {
+                    if v.get("format").and_then(|f| f.as_str()) != Some(cipher::FORMAT_BUNDLE) {
+                        errors.push(i18n::trf("err.import.not_bundle", &[("fname", fname.as_str())]));
+                    } else {
+                        sealed.push((fname, v));
+                    }
+                } else if v.get("format").and_then(|f| f.as_str()) == Some(store::BUNDLE_FORMAT) {
+                    plain.push((fname, v));
                 } else {
-                    sealed.push((fname, v));
+                    errors.push(i18n::trf("err.import.not_bundle", &[("fname", fname.as_str())]));
                 }
             }
             Err(e) => errors.push(i18n::trf("err.import.json", &[("fname", fname.as_str()), ("e", &e.to_string())])),
         }
     }
-    Ok(json!({ "picked": true, "sealed": sealed, "errors": errors }))
+    Ok(json!({ "picked": true, "sealed": sealed, "plain": plain, "errors": errors }))
 }
 
 #[tauri::command]
@@ -1064,9 +1101,14 @@ async fn import_sealed(app: AppHandle, files: Vec<(String, Value)>, password: St
     let mut decrypted = vec![];
     let mut errors = vec![];
     for (fname, v) in files {
-        match cipher::open(&v, &password) {
-            Ok(payload) => decrypted.push((fname, payload)),
-            Err(e) => errors.push(i18n::trf("err.import.wrap", &[("fname", fname.as_str()), ("e", &e)])),
+        if cipher::is_sealed(&v) {
+            match cipher::open(&v, &password) {
+                Ok(payload) => decrypted.push((fname, payload)),
+                Err(e) => errors.push(i18n::trf("err.import.wrap", &[("fname", fname.as_str()), ("e", &e)])),
+            }
+        } else {
+            // Bundle plaintext .json — không cần mật khẩu
+            decrypted.push((fname, v));
         }
     }
     let mut report = if decrypted.is_empty() {
@@ -1142,6 +1184,7 @@ pub fn run() {
             delete_account,
             update_account_from_live,
             switch_to,
+            logout,
             get_live_quota,
             get_account_quota,
             claim_preview,
