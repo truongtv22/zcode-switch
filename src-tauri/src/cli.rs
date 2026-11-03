@@ -267,13 +267,12 @@ pub fn run(args: &[String]) -> (String, i32) {
             } else {
                 None
             };
-            match load_account(&paths, &id) {
-                Ok(a) => {
-                    let payload = export_bundle_value(std::slice::from_ref(&a));
-                    write_bundle_payload(&out_path, &payload, password)
-                        .map(|enc| ok(json!({ "out": out_path, "encrypted": enc })))
-                        .unwrap_or_else(|e| (err(&e), 1))
-                }
+            let payload = match load_account(&paths, &id) {
+                Ok(a) => export_bundle_value(std::slice::from_ref(&a)),
+                Err(e) => return (err(&e), 1),
+            };
+            match write_bundle_payload(&out_path, &payload, password) {
+                Ok(enc) => ok(json!({ "out": out_path, "encrypted": enc })),
                 Err(e) => return (err(&e), 1),
             }
         }
@@ -294,10 +293,12 @@ pub fn run(args: &[String]) -> (String, i32) {
             } else {
                 None
             };
-            match list_accounts(&paths).map(|a| export_bundle_value(&a)) {
-                Ok(payload) => write_bundle_payload(&out_path, &payload, password)
-                    .map(|enc| ok(json!({ "out": out_path, "encrypted": enc })))
-                    .unwrap_or_else(|e| (err(&e), 1)),
+            let payload = match list_accounts(&paths) {
+                Ok(a) => export_bundle_value(&a),
+                Err(e) => return (err(&e), 1),
+            };
+            match write_bundle_payload(&out_path, &payload, password) {
+                Ok(enc) => ok(json!({ "out": out_path, "encrypted": enc })),
                 Err(e) => return (err(&e), 1),
             }
         }
